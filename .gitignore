@@ -45,6 +45,7 @@ htmlcov/
 *.sqlite
 *.sqlite3
 *.db
+*.tantivy/
 
 scratch/
 tmp/

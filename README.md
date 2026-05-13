@@ -54,15 +54,23 @@ Edit `src/document_indexer/ocr/metadata.py`. The `build_metadata(pdf_path)` func
 ## Indexer GUI
 
 ```bash
-uv run docindex-gui [--index DIR] [--ingest PATH] [--format {auto,txt,ndjson}]
+uv run docindex-gui [--preset PRESET.json]
 ```
 
-- `--index` — Tantivy index directory. Default `docindex.tantivy`.
-- `--ingest` — file or directory to import before opening the GUI. Use `--format` to override auto-detection. Repeatable.
+The window is a schema-driven Tantivy indexer. It is **not** a search tool — it
+only writes the index directory. Pair it with a separate search front-end of
+your choice (e.g. Quickwit, a CLI script, or your own UI).
 
-The GUI provides a search box, BM25-ranked results, HTML snippet preview, and an action to open the source file. Indexing can also be triggered from the GUI via **File → Ingest folder…**.
+Workflow:
 
-Query syntax follows Tantivy: `radio AND broadcast`, `"exact phrase"`, `title:history`, `body:tower~`, etc.
+1. **Paths** — pick a source folder and an output directory for the Tantivy index. Choose **TXT** (one file = one document) or **NDJSON** (one line = one document).
+2. **Schema** — edit the field table. Each row defines one Tantivy field (`text`/`integer`/`date`) plus the rule that pulls its value (from file contents, filename, regex on the filename, a JSON key, etc.). The `TXT defaults` and `NDJSON defaults` buttons seed sensible defaults.
+3. **Indexer params** — Tantivy writer heap size (preset buttons + custom MB) and writer thread count.
+4. **Run** — progress bar, log, and a cancel button (rolls back uncommitted writes).
+
+Drop a `schema.ndjson` file at the root of an NDJSON source folder to auto-load the schema. Each non-empty, non-comment line is one field definition.
+
+Presets (paths + params + schema) can be saved/loaded from the toolbar or passed via `--preset PATH.json` on launch.
 
 ## Development
 
