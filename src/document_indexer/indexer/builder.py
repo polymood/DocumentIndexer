@@ -232,6 +232,71 @@ def _run_ndjson(
     return IndexResult(documents=indexed, files=len(files))
 
 
+@dataclass(slots=True)
+class PreviewDoc:
+    """One document the indexer would produce, plus where it came from."""
+
+    source: str
+    values: dict[str, Any]
+
+
+def preview(config: IndexerConfig, sample_count: int = 3) -> list[PreviewDoc]:
+    """Build up to ``sample_count`` example documents without opening a writer.
+
+    Lets the GUI show the user exactly what will be stored for each field
+    before the index is built. Raises ``ValueError`` for unusable configs.
+    """
+    if not config.src_folder:
+        raise ValueError("Source folder is required.")
+    src = Path(config.src_folder)
+    if not src.is_dir():
+        raise ValueError(f"Source folder not found: {config.src_folder}")
+    if not config.fields:
+        raise ValueError("At least one field must be defined.")
+    if sample_count <= 0:
+        return []
+
+    samples: list[PreviewDoc] = []
+
+    if config.input_mode == "txt":
+        files = _list_files(src, config.glob_pattern, config.recursive)
+        for file_path in files[:sample_count]:
+            try:
+                values = _build_doc_from_file(config.fields, file_path, src)
+            except OSError as exc:
+                values = {"_error": str(exc)}
+            samples.append(PreviewDoc(source=str(file_path), values=values))
+        return samples
+
+    pattern = config.glob_pattern if config.glob_pattern.endswith(".ndjson") else "*.ndjson"
+    files = _list_files(src, pattern, config.recursive, exclude={"schema.ndjson"})
+    remaining = sample_count
+    for file_path in files:
+        if remaining <= 0:
+            break
+        try:
+            handle = file_path.open("r", encoding="utf-8", errors="ignore")
+        except OSError:
+            continue
+        with handle as fh:
+            for line_no, raw in enumerate(fh, start=1):
+                if remaining <= 0:
+                    break
+                line = raw.strip()
+                if not line:
+                    continue
+                try:
+                    obj = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if not isinstance(obj, dict):
+                    continue
+                values = _build_doc_from_obj(config.fields, obj, file_path, src)
+                samples.append(PreviewDoc(source=f"{file_path}:{line_no}", values=values))
+                remaining -= 1
+    return samples
+
+
 def validate(config: IndexerConfig) -> None:
     """Validate the configuration before opening writers; raises ``ValueError``."""
     if not config.src_folder:

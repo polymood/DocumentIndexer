@@ -32,12 +32,14 @@ from PySide6.QtWidgets import (
     QTableWidget,
     QTextEdit,
     QToolBar,
+    QTreeWidget,
+    QTreeWidgetItem,
     QVBoxLayout,
     QWidget,
 )
 
 from document_indexer import __version__
-from document_indexer.indexer.builder import IndexResult, run
+from document_indexer.indexer.builder import IndexResult, preview, run
 from document_indexer.indexer.schema import (
     FIELD_TYPES,
     SOURCE_HELP,
@@ -427,6 +429,43 @@ class MainWindow(QMainWindow):
         schema_layout.addLayout(btn_row)
         root.addWidget(schema_group, 2)
 
+        preview_group = QGroupBox("Preview (sample documents)")
+        preview_layout = QVBoxLayout(preview_group)
+        preview_controls = QHBoxLayout()
+        self._preview_count = QSpinBox()
+        self._preview_count.setRange(1, 25)
+        self._preview_count.setValue(3)
+        self._preview_count.setSuffix(" docs")
+        self._preview_count.setToolTip("How many sample documents to preview.")
+        self._preview_truncate = QSpinBox()
+        self._preview_truncate.setRange(40, 4000)
+        self._preview_truncate.setSingleStep(40)
+        self._preview_truncate.setValue(200)
+        self._preview_truncate.setSuffix(" chars/field")
+        self._preview_truncate.setToolTip("Truncate each field value to this many characters.")
+        preview_btn = QPushButton("Refresh preview")
+        preview_btn.setToolTip(
+            "Read the first N source documents and show the values the indexer would store."
+        )
+        preview_btn.clicked.connect(self._refresh_preview)
+        preview_controls.addWidget(QLabel("samples:"))
+        preview_controls.addWidget(self._preview_count)
+        preview_controls.addWidget(QLabel("truncate:"))
+        preview_controls.addWidget(self._preview_truncate)
+        preview_controls.addWidget(preview_btn)
+        preview_controls.addStretch()
+        preview_layout.addLayout(preview_controls)
+
+        self._preview_tree = QTreeWidget()
+        self._preview_tree.setHeaderLabels(["Field / source", "Value"])
+        self._preview_tree.setColumnWidth(0, 240)
+        self._preview_tree.setUniformRowHeights(False)
+        self._preview_tree.setAlternatingRowColors(True)
+        self._preview_tree.setWordWrap(True)
+        preview_layout.addWidget(self._preview_tree, 1)
+
+        root.addWidget(preview_group, 2)
+
         run_group = QGroupBox("Run")
         run_layout = QVBoxLayout(run_group)
         self._progress = QProgressBar()
@@ -542,6 +581,55 @@ class MainWindow(QMainWindow):
             return
         self.apply_config(config)
         self._append_log(f"Loaded preset <- {path}")
+
+    @staticmethod
+    def _format_value(value: object, limit: int) -> str:
+        text = "" if value is None else str(value)
+        if len(text) <= limit:
+            return text
+        return text[:limit] + f"... [+{len(text) - limit} chars]"
+
+    def _refresh_preview(self) -> None:
+        config = self._build_config()
+        truncate = self._preview_truncate.value()
+        self._preview_tree.clear()
+        try:
+            samples = preview(config, sample_count=self._preview_count.value())
+        except ValueError as exc:
+            placeholder = QTreeWidgetItem(["(preview unavailable)", str(exc)])
+            self._preview_tree.addTopLevelItem(placeholder)
+            return
+        except Exception as exc:  # pragma: no cover - defensive
+            QMessageBox.warning(self, "Preview failed", str(exc))
+            return
+
+        if not samples:
+            empty = QTreeWidgetItem(
+                ["(no documents)", "No files matched the pattern under the source folder."]
+            )
+            self._preview_tree.addTopLevelItem(empty)
+            return
+
+        schema_field_names = [f.name for f in config.fields if f.name]
+        for idx, sample in enumerate(samples, start=1):
+            doc_item = QTreeWidgetItem([f"Document {idx}", sample.source])
+            doc_item.setFirstColumnSpanned(False)
+            self._preview_tree.addTopLevelItem(doc_item)
+            for name in schema_field_names:
+                if name not in sample.values:
+                    child = QTreeWidgetItem([name, "(empty / coerced out)"])
+                else:
+                    child = QTreeWidgetItem(
+                        [name, self._format_value(sample.values[name], truncate)]
+                    )
+                doc_item.addChild(child)
+            extra_keys = set(sample.values) - set(schema_field_names)
+            for key in sorted(extra_keys):
+                child = QTreeWidgetItem(
+                    [f"({key})", self._format_value(sample.values[key], truncate)]
+                )
+                doc_item.addChild(child)
+            doc_item.setExpanded(True)
 
     def _start(self) -> None:
         config = self._build_config()
