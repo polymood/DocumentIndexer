@@ -19,10 +19,32 @@ def write_txt(result: ExtractionResult, output_root: Path, input_root: Path) -> 
     return out_path
 
 
-def write_ndjson_record(result: ExtractionResult, out_path: Path) -> dict[str, Any]:
+def write_ia_txt(
+    result: ExtractionResult,
+    output_root: Path,
+    input_root: Path,
+    identifier: str,
+) -> Path:
+    """Write IA item text to ``<output_root>/<rel-collection-dir>/<identifier>.txt``."""
+    item_dir = result.pdf_path.parent if result.pdf_path is not None else input_root
+    try:
+        rel_dir = item_dir.resolve().relative_to(input_root.resolve()).parent
+    except ValueError:
+        rel_dir = Path()
+    out_path = output_root / rel_dir / f"{identifier}.txt"
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    out_path.write_text(result.text, encoding="utf-8")
+    return out_path
+
+
+def write_ndjson_record(
+    result: ExtractionResult,
+    out_path: Path,
+    extra_metadata: dict[str, Any] | None = None,
+) -> dict[str, Any]:
     """Append one NDJSON record for ``result`` to ``out_path`` and return it."""
     record: dict[str, Any] = {
-        **build_metadata(result.pdf_path),
+        **build_metadata(result.pdf_path, extra_metadata),
         "text": result.text,
         "stats": {
             "page_count": result.page_count,

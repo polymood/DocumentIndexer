@@ -12,6 +12,7 @@ import pytesseract
 from loguru import logger
 from PIL import Image, ImageOps
 
+from document_indexer.ocr.ia import IAItem, read_djvu_text
 from document_indexer.ocr.lang import detect_lang_from_text, lang_from_path
 from document_indexer.ocr.tesseract import clamp_workers
 
@@ -256,3 +257,48 @@ def extract(
             ocr_pages=0,
             error=str(exc),
         )
+
+
+def extract_from_ia_item(item: IAItem) -> ExtractionResult:
+    """Build an :class:`ExtractionResult` from a pre-existing IA djvu.txt file.
+
+    No PDF rendering, no Tesseract call. Page count, where known, is taken
+    from form-feed delimiters; otherwise 1.
+    """
+    if item.djvu_txt_path is None:
+        raise ValueError(f"IAItem {item.identifier} has no djvu.txt to import")
+    try:
+        text = read_djvu_text(item.djvu_txt_path)
+    except OSError as exc:
+        return ExtractionResult(
+            pdf_path=item.djvu_txt_path,
+            text="",
+            pages=[],
+            method="failed",
+            language="",
+            language_source="n/a",
+            page_count=0,
+            char_count=0,
+            word_count=0,
+            file_size_bytes=0,
+            direct_pages=0,
+            ocr_pages=0,
+            error=str(exc),
+        )
+
+    pages = text.split("\x0c") if "\x0c" in text else [text]
+    page_count = len(pages)
+    return ExtractionResult(
+        pdf_path=item.pdf_path or item.djvu_txt_path,
+        text=text,
+        pages=pages,
+        method="djvu-import",
+        language="",
+        language_source="ia-djvu",
+        page_count=page_count,
+        char_count=len(text),
+        word_count=len(text.split()),
+        file_size_bytes=item.djvu_txt_path.stat().st_size,
+        direct_pages=page_count,
+        ocr_pages=0,
+    )
