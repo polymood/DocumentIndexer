@@ -23,6 +23,7 @@ Image.MAX_IMAGE_PIXELS = None
 TEXT_LAYER_THRESHOLD: int = 80
 TESS_CONFIG: str = "--oem 1 --psm 3"
 
+OCR_BACKENDS = ("tesseract", "locro")
 
 _FITZ_LOCK = threading.Lock()
 
@@ -73,7 +74,7 @@ def _render_pages_batch(pdf_path: Path, indices: list[int], dpi: int) -> list[Im
     return images
 
 
-def _ocr_one_page(args: tuple[int, Image.Image, str]) -> tuple[int, str]:
+def _ocr_one_page_tesseract(args: tuple[int, Image.Image, str]) -> tuple[int, str]:
     idx, img, lang = args
     img = ImageOps.grayscale(img)
     img = ImageOps.autocontrast(img, cutoff=1)
@@ -88,10 +89,23 @@ def _ocr_pages(
     dpi: int,
     workers: int,
     page_chunk: int,
+    backend: str = "tesseract",
 ) -> dict[int, str]:
     if not indices:
         return {}
+    if backend not in OCR_BACKENDS:
+        raise ValueError(f"Unknown OCR backend '{backend}'. Options: {OCR_BACKENDS}")
+
+    # locro renders pages internally (via PyMuPDF at its own DPI). Skip our
+    # render loop entirely and hand it the PDF path + page list in one call.
+    if backend == "locro":
+        from document_indexer.ocr.locro import ocr_pdf_pages
+
+        return ocr_pdf_pages(pdf_path, indices)
+
     workers = clamp_workers(workers)
+    page_fn = _ocr_one_page_tesseract
+
     sorted_indices = sorted(set(indices))
     chunk = page_chunk if page_chunk > 0 else len(sorted_indices)
     results: dict[int, str] = {}
@@ -100,9 +114,13 @@ def _ocr_pages(
         batch = sorted_indices[start : start + chunk]
         images = _render_pages_batch(pdf_path, batch, dpi)
         tasks = [(idx, img, lang) for idx, img in zip(batch, images, strict=True)]
-        with ThreadPoolExecutor(max_workers=min(workers, len(tasks))) as pool:
-            for idx, text in pool.map(_ocr_one_page, tasks):
+        if workers <= 1:
+            for idx, text in map(page_fn, tasks):
                 results[idx] = text
+        else:
+            with ThreadPoolExecutor(max_workers=min(workers, len(tasks))) as pool:
+                for idx, text in pool.map(page_fn, tasks):
+                    results[idx] = text
         for img in images:
             img.close()
 
@@ -120,6 +138,7 @@ def _resolve_ocr_lang(
     fallback_lang: str,
     auto_lang: bool,
     sample_dpi: int,
+    backend: str = "tesseract",
 ) -> tuple[str, str, list[int], dict[int, str]]:
     """Resolve the language used for OCR.
 
@@ -139,7 +158,7 @@ def _resolve_ocr_lang(
         return detected, "direct-text", sparse_idx, {}
 
     sample_idx = sparse_idx[0]
-    sample = _ocr_pages(pdf_path, [sample_idx], "eng", sample_dpi, 1, 1)
+    sample = _ocr_pages(pdf_path, [sample_idx], "eng", sample_dpi, 1, 1, backend=backend)
     sample_text = sample.get(sample_idx, "")
     detected = detect_lang_from_text(sample_text)
     if detected:
@@ -159,15 +178,41 @@ def extract(
     page_chunk: int = 24,
     text_threshold: int = TEXT_LAYER_THRESHOLD,
     force_ocr: bool = False,
+    force_text: bool = False,
     auto_lang: bool = False,
+    ocr_backend: str = "tesseract",
 ) -> ExtractionResult:
-    """Extract text from ``pdf_path`` using a hybrid direct+OCR strategy."""
+    """Extract text from ``pdf_path`` using a hybrid direct+OCR strategy.
+
+    When ``force_text`` is set, only the embedded text layer is read; OCR is
+    skipped entirely and pages without a text layer come back empty.
+    """
+    if force_ocr and force_text:
+        raise ValueError("force_ocr and force_text are mutually exclusive")
     try:
         file_size = pdf_path.stat().st_size
         page_texts = _extract_direct_per_page(pdf_path)
         total_pages = len(page_texts)
         if total_pages == 0:
             raise RuntimeError("0-page PDF")
+
+        if force_text:
+            text = _assemble(page_texts)
+            empty_pages = sum(1 for t in page_texts if len(t.strip()) < text_threshold)
+            return ExtractionResult(
+                pdf_path=pdf_path,
+                text=text,
+                pages=page_texts,
+                method="text-only",
+                language="",
+                language_source="n/a",
+                page_count=total_pages,
+                char_count=len(text),
+                word_count=len(text.split()),
+                file_size_bytes=file_size,
+                direct_pages=total_pages - empty_pages,
+                ocr_pages=0,
+            )
 
         if force_ocr:
             sparse_idx = list(range(total_pages))
@@ -201,12 +246,14 @@ def extract(
             fallback_lang=ocr_lang,
             auto_lang=auto_lang,
             sample_dpi=ocr_dpi,
+            backend=ocr_backend,
         )
         for idx, text in pre_ocred.items():
             page_texts[idx] = text
 
-        effective_workers = clamp_workers(ocr_workers)
-        method = "ocr" if direct_count == 0 or force_ocr else "hybrid"
+        effective_workers = 1 if ocr_backend == "locro" else clamp_workers(ocr_workers)
+        method_prefix = "locro-" if ocr_backend == "locro" else ""
+        method = f"{method_prefix}{'ocr' if direct_count == 0 or force_ocr else 'hybrid'}"
         logger.info(
             f"{pdf_path.name}: {method} "
             f"(direct {direct_count}p, OCR {len(remaining_sparse)}p, "
@@ -220,6 +267,7 @@ def extract(
             dpi=ocr_dpi,
             workers=effective_workers,
             page_chunk=page_chunk,
+            backend=ocr_backend,
         )
         for idx, text in ocr_results.items():
             page_texts[idx] = text

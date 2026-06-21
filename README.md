@@ -36,7 +36,8 @@ uv run docindex-ocr INPUT [INPUT ...] --output OUT_DIR [OPTIONS]
 - `INPUT` — PDF file or directory (recursed for `*.pdf`).
 - `--output` — destination directory. Mirrors the input layout under it.
 - `--format {txt,ndjson}` — output format. Default `txt`. `ndjson` writes one record per document with a metadata block plus the full text.
-- `--ocr-lang LANG` — Tesseract language string (e.g. `eng`, `eng+deu`). Default `eng+deu`.
+- `--ocr-backend {tesseract,deepseek}` — OCR engine. Default `tesseract`. See [DeepSeek-OCR backend](#deepseek-ocr-backend) for the VLM option.
+- `--ocr-lang LANG` — Tesseract language string (e.g. `eng`, `eng+deu`). Default `eng+deu`. Ignored when `--ocr-backend deepseek`.
 - `--auto-lang` — per-document language detection. Order of resolution:
   1. parent-folder map (edit `LANG_MAP` in `lang.py`),
   2. lingua detector on any direct-extracted text,
@@ -46,6 +47,48 @@ uv run docindex-ocr INPUT [INPUT ...] --output OUT_DIR [OPTIONS]
 - `--max-pages N` — pages rendered per OCR batch. Default 24.
 - `--force-ocr` — OCR even when a text layer exists.
 - `--workers N` — number of PDFs processed in parallel. Default 1 (recommended: one PDF at a time, all cores on its pages).
+
+### DeepSeek-OCR backend
+
+[DeepSeek-OCR](https://huggingface.co/deepseek-ai/DeepSeek-OCR) is a 3B-parameter vision-language model that outputs structured markdown (tables, formulas, headings). Better than Tesseract on complex layouts, scanned books, charts, and CJK text. Requires a GPU.
+
+**1. Install GPU-enabled PyTorch first**, matching your hardware:
+
+```bash
+# AMD ROCm 6.2 (RDNA3 like RX 7700/7800/7900 XT/XTX — natively supported)
+uv pip install torch --index-url https://download.pytorch.org/whl/rocm6.2
+
+# AMD ROCm 6.3
+uv pip install torch --index-url https://download.pytorch.org/whl/rocm6.3
+
+# NVIDIA CUDA 12.4
+uv pip install torch --index-url https://download.pytorch.org/whl/cu124
+```
+
+**2. Install the extras** (skips torch since it's already there):
+
+```bash
+uv pip install -e '.[deepseek]'
+```
+
+**3. Run**:
+
+```bash
+docindex-ocr book.pdf --output out --ocr-backend deepseek --format ndjson
+```
+
+**Environment variables**:
+
+- `DEEPSEEK_OCR_MODEL` — override model id (default `deepseek-ai/DeepSeek-OCR`).
+- `DEEPSEEK_OCR_ATTN` — attention impl. Default `eager` (works on ROCm). Set to `flash_attention_2` on NVIDIA after `pip install flash-attn==2.7.3`.
+- `DEEPSEEK_OCR_DEVICE` — default `cuda` (ROCm's PyTorch also uses the `cuda` device name via HIP).
+
+**Notes**:
+
+- First run downloads ~6 GB of weights into the HuggingFace cache.
+- Uses bf16 + the `gundam` preset (1024 base / 640 image / crop on) by default — best quality/speed tradeoff and fits comfortably in 16 GB VRAM.
+- `--ocr-workers` is forced to 1 (the GPU is the bottleneck).
+- Output is markdown, not plain text — well-suited for downstream LLM ingestion.
 
 ### Customising NDJSON metadata
 

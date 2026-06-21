@@ -5,7 +5,8 @@ from __future__ import annotations
 import argparse
 import sys
 from collections.abc import Iterable
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor, as_completed
+from dataclasses import dataclass
 from pathlib import Path
 
 from loguru import logger
@@ -15,6 +16,7 @@ from document_indexer.ocr.extract import extract, extract_from_ia_item
 from document_indexer.ocr.ia import IAItem, is_ia_item, iter_ia_items, parse_meta_xml
 from document_indexer.ocr.lang import warm_up_detector
 from document_indexer.ocr.output import write_ia_txt, write_ndjson_record, write_txt
+from document_indexer.ocr.progress import PROGRESS_FILENAME, ProgressTracker
 from document_indexer.ocr.tesseract import MAX_OCR_WORKERS, clamp_workers, resolve_lang
 
 
@@ -72,9 +74,19 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Output format. NDJSON writes one record per PDF into <output>/documents.ndjson.",
     )
     parser.add_argument(
+        "--ocr-backend",
+        choices=["tesseract", "locro"],
+        default="tesseract",
+        help=(
+            "OCR engine. 'tesseract' (default) uses installed Tesseract; "
+            "'locro' uses Chrome's screen-ai via the clv-locro wrapper "
+            "(install clv-locro from https://github.com/sergiocorreia/clv-locro)."
+        ),
+    )
+    parser.add_argument(
         "--ocr-lang",
         default="eng+deu",
-        help="Tesseract languages (e.g. 'eng', 'eng+deu'). Pass 'auto' for all installed.",
+        help="Tesseract languages (e.g. 'eng', 'eng+deu'). Pass 'auto' for all installed. Ignored for --ocr-backend locro.",
     )
     parser.add_argument(
         "--ocr-dpi", "--dpi", type=int, default=200, help="DPI for OCR rendering (default 200)."
@@ -98,14 +110,51 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Parallel document workers (default 1; one PDF at a time uses all cores per page).",
     )
     parser.add_argument(
+        "--worker-mode",
+        choices=["thread", "process"],
+        default="thread",
+        help=(
+            "How to parallelise document workers. 'thread' (default) shares "
+            "the engine across workers -- fine for tesseract, useless for "
+            "backends that hold a global lock (locro). "
+            "'process' spawns one OS process per worker, each with its own "
+            "engine, giving real parallelism at the cost of N × engine memory."
+        ),
+    )
+    parser.add_argument(
         "--force-ocr",
         action="store_true",
         help="Run OCR on every page, ignoring the embedded text layer.",
     )
     parser.add_argument(
+        "--force-text",
+        action="store_true",
+        help=(
+            "Text-layer only: read embedded text from every PDF and never run "
+            "OCR. Pages without a text layer come back empty. Mutually "
+            "exclusive with --force-ocr."
+        ),
+    )
+    parser.add_argument(
         "--auto-lang",
         action="store_true",
         help="Per-document language detection via folder map and lingua.",
+    )
+    parser.add_argument(
+        "--no-resume",
+        action="store_true",
+        help=(
+            "Disable resume from progress ledger; reprocess every input even "
+            "if a previous run completed it."
+        ),
+    )
+    parser.add_argument(
+        "--reset-progress",
+        action="store_true",
+        help=(
+            "Delete the progress ledger in <output> before starting. Forces a "
+            "full reprocess but keeps existing output files in place."
+        ),
     )
     parser.add_argument(
         "--ia",
@@ -166,18 +215,148 @@ def _collect_ia_items(inputs: list[Path]) -> list[IAItem]:
     return items
 
 
+@dataclass(slots=True, frozen=True)
+class PdfJobConfig:
+    """Picklable bundle of per-PDF runner config (shared across all PDFs in a run)."""
+
+    ocr_lang: str
+    ocr_dpi: int
+    ocr_workers: int
+    page_chunk: int
+    force_ocr: bool
+    force_text: bool
+    auto_lang: bool
+    ocr_backend: str
+    output_format: str
+    output_dir: Path
+    input_root: Path
+    ndjson_path: Path
+    verbose: bool
+
+
+# In worker processes the backend engine is loaded lazily on the first task.
+_WORKER_BACKEND: str | None = None
+
+
+def _pdf_worker_init(config: PdfJobConfig) -> None:
+    """Initializer for ProcessPoolExecutor workers.
+
+    Sets backend-specific env vars (must happen *before* the backend module
+    is imported) and reconfigures loguru for the worker process. Backend
+    warm-up is deferred to the first task -- otherwise eight workers would
+    all download/load models in parallel just to reach the same memory
+    state.
+    """
+    global _WORKER_BACKEND
+
+    _configure_logger(config.verbose)
+    _WORKER_BACKEND = config.ocr_backend
+
+
+def _warm_up_worker_backend(backend: str, verbose: bool) -> None:
+    """Lazy backend warm-up inside a worker process."""
+    if backend == "locro":
+        from document_indexer.ocr.locro import reattach_loguru_sink, warm_up
+
+        warm_up()
+        reattach_loguru_sink(verbose=verbose)
+
+
+def _pdf_worker(pdf_path: Path, config: PdfJobConfig) -> dict[str, object]:
+    """Process one PDF inside a worker. Returns a status dict for the main process."""
+    global _WORKER_BACKEND
+    if _WORKER_BACKEND != "__warmed__":
+        try:
+            _warm_up_worker_backend(config.ocr_backend, config.verbose)
+        except Exception as exc:
+            return {"ok": False, "key": str(pdf_path.resolve()), "error": f"warm-up: {exc}"}
+        _WORKER_BACKEND = "__warmed__"
+
+    result = extract(
+        pdf_path,
+        ocr_lang=config.ocr_lang,
+        ocr_dpi=config.ocr_dpi,
+        ocr_workers=config.ocr_workers,
+        page_chunk=config.page_chunk,
+        force_ocr=config.force_ocr,
+        force_text=config.force_text,
+        auto_lang=config.auto_lang,
+        ocr_backend=config.ocr_backend,
+    )
+    if not result.succeeded:
+        return {
+            "ok": False,
+            "key": str(pdf_path.resolve()),
+            "error": result.error or "extraction failed",
+        }
+    if config.output_format == "txt":
+        out_path = write_txt(result, config.output_dir, config.input_root)
+        target = str(out_path)
+    else:
+        write_ndjson_record(result, config.ndjson_path)
+        target = config.ndjson_path.name
+    logger.info(f"[{result.method}] {result.page_count}p {result.word_count:,}w -> {target}")
+    return {
+        "ok": True,
+        "key": str(pdf_path.resolve()),
+        "method": result.method,
+        "pages": result.page_count,
+        "words": result.word_count,
+    }
+
+
 def main(argv: list[str] | None = None) -> int:
     """Entry point for the ``docindex-ocr`` script."""
-    args = _build_parser().parse_args(argv)
+    parser = _build_parser()
+    args = parser.parse_args(argv)
     _configure_logger(args.verbose)
+
+    if args.force_ocr and args.force_text:
+        parser.error("--force-ocr and --force-text are mutually exclusive")
 
     args.output.mkdir(parents=True, exist_ok=True)
     input_root = _common_root(args.inputs)
     ndjson_path = args.output / "documents.ndjson"
 
-    ocr_lang = resolve_lang(args.ocr_lang)
+    progress = ProgressTracker(args.output / PROGRESS_FILENAME, enabled=not args.no_resume)
+    if args.reset_progress:
+        progress.reset()
+        logger.info("progress: ledger reset")
+    elif not args.no_resume and progress.completed_count:
+        logger.info(
+            f"progress: {progress.completed_count} previously-completed item(s) will be skipped"
+        )
+
+    ocr_lang = resolve_lang(args.ocr_lang) if args.ocr_backend == "tesseract" else ""
+
     if args.auto_lang:
         warm_up_detector()
+
+    if args.ocr_backend == "locro":
+        from document_indexer.ocr.locro import is_available as locro_available
+        from document_indexer.ocr.locro import reattach_loguru_sink as locro_reattach
+        from document_indexer.ocr.locro import warm_up as locro_warm_up
+
+        if not locro_available():
+            logger.error(
+                "locro backend requires the `locro` package "
+                "(https://github.com/sergiocorreia/clv-locro). "
+                "Install with `pip install -e /path/to/clv-locro`."
+            )
+            return 1
+        try:
+            locro_warm_up()
+        except RuntimeError as exc:
+            logger.error(f"locro init failed: {exc}")
+            return 1
+        # locro redirected fd 2 during init -- re-point loguru at the
+        # newly-installed sys.stderr so subsequent logs are visible.
+        locro_reattach(verbose=args.verbose)
+        if args.workers > 1:
+            logger.warning(
+                "locro DLL is not thread-safe; --workers > 1 will serialize "
+                "on the engine lock. Use tesseract for parallel doc workers."
+            )
 
     ia_mode = _detect_ia_mode(args.inputs, args.ia)
 
@@ -193,63 +372,105 @@ def main(argv: list[str] | None = None) -> int:
             f"workers={args.workers} | ocr-workers={clamp_workers(args.ocr_workers)} "
             f"| dpi={args.ocr_dpi}"
         )
-        return _run_ia(args, items, input_root, ndjson_path, ocr_lang)
+        return _run_ia(args, items, input_root, ndjson_path, ocr_lang, progress)
 
     pdf_paths = list(_iter_pdfs(args.inputs))
     if not pdf_paths:
         logger.error("No PDFs found in the provided inputs.")
         return 1
 
+    # Filter previously-completed inputs. Done strictly per-file: an entry
+    # in the ledger only exists after the full extract + write succeeded.
+    pending: list[Path] = []
+    skipped = 0
+    for path in pdf_paths:
+        key = str(path.resolve())
+        if progress.is_done(key):
+            skipped += 1
+            continue
+        pending.append(path)
+    if skipped:
+        logger.info(f"resume: skipping {skipped} previously-completed PDF(s)")
+
     logger.info(
-        f"docindex-ocr {__version__} | {len(pdf_paths)} PDF(s) | "
-        f"format={args.format} | workers={args.workers} | "
+        f"docindex-ocr {__version__} | {len(pending)} PDF(s) to process "
+        f"({len(pdf_paths)} total) | format={args.format} | workers={args.workers} | "
         f"ocr-workers={clamp_workers(args.ocr_workers)} | dpi={args.ocr_dpi}"
     )
 
     done = failed = 0
 
-    def _run_pdf(pdf_path: Path) -> bool:
-        result = extract(
-            pdf_path,
-            ocr_lang=ocr_lang,
-            ocr_dpi=args.ocr_dpi,
-            ocr_workers=args.ocr_workers,
-            page_chunk=args.max_pages,
-            force_ocr=args.force_ocr,
-            auto_lang=args.auto_lang,
-        )
-        if not result.succeeded:
+    job_config = PdfJobConfig(
+        ocr_lang=ocr_lang,
+        ocr_dpi=args.ocr_dpi,
+        ocr_workers=args.ocr_workers,
+        page_chunk=args.max_pages,
+        force_ocr=args.force_ocr,
+        force_text=args.force_text,
+        auto_lang=args.auto_lang,
+        ocr_backend=args.ocr_backend,
+        output_format=args.format,
+        output_dir=args.output,
+        input_root=input_root,
+        ndjson_path=ndjson_path,
+        verbose=args.verbose,
+    )
+
+    def _record_result(res: dict[str, object]) -> bool:
+        nonlocal done, failed
+        if not res.get("ok"):
+            failed += 1
+            err = res.get("error", "")
+            logger.error(f"failed: {res.get('key')}: {err}")
             return False
-        if args.format == "txt":
-            out_path = write_txt(result, args.output, input_root)
-            logger.info(
-                f"[{result.method}] {result.page_count}p {result.word_count:,}w -> {out_path}"
-            )
-        else:
-            write_ndjson_record(result, ndjson_path)
-            logger.info(
-                f"[{result.method}] {result.page_count}p {result.word_count:,}w -> "
-                f"{ndjson_path.name}"
-            )
+        progress.mark_done(
+            str(res["key"]),
+            method=str(res.get("method", "")),
+            pages=int(res.get("pages", 0) or 0),
+            words=int(res.get("words", 0) or 0),
+        )
+        done += 1
         return True
+
+    def _run_single(path: Path) -> dict[str, object]:
+        return _pdf_worker(path, job_config)
 
     workers = max(1, args.workers)
     if workers == 1:
-        for path in pdf_paths:
-            if _run_pdf(path):
-                done += 1
-            else:
-                failed += 1
+        for path in pending:
+            _record_result(_run_single(path))
+    elif args.worker_mode == "process":
+        # ProcessPoolExecutor with spawn so backends that mutate process-global
+        # state (e.g. locro's fd-2 redirection + CDLL handle) cannot inherit a
+        # half-initialised parent. Each worker warms up its backend lazily on
+        # first task.
+        import multiprocessing as mp
+
+        ctx = mp.get_context("spawn")
+        with ProcessPoolExecutor(
+            max_workers=workers,
+            mp_context=ctx,
+            initializer=_pdf_worker_init,
+            initargs=(job_config,),
+        ) as pool:
+            futures = {pool.submit(_pdf_worker, path, job_config): path for path in pending}
+            for fut in as_completed(futures):
+                try:
+                    _record_result(fut.result())
+                except Exception as exc:
+                    failed += 1
+                    logger.error(f"worker crashed: {futures[fut]}: {exc}")
     else:
         with ThreadPoolExecutor(max_workers=workers) as pool:
-            futures = {pool.submit(_run_pdf, path): path for path in pdf_paths}
+            futures = {pool.submit(_run_single, path): path for path in pending}
             for fut in as_completed(futures):
-                if fut.result():
-                    done += 1
-                else:
+                try:
+                    _record_result(fut.result())
+                except Exception as exc:
                     failed += 1
+                    logger.error(f"worker crashed: {futures[fut]}: {exc}")
 
-    logger.info(f"Done. Extracted: {done}, failed: {failed}")
+    logger.info(f"Done. Extracted: {done}, failed: {failed}, skipped(resumed): {skipped}")
     return 0 if failed == 0 else 2
 
 
@@ -259,7 +480,21 @@ def _run_ia(
     input_root: Path,
     ndjson_path: Path,
     ocr_lang: str,
+    progress: ProgressTracker,
 ) -> int:
+    # Filter previously-completed items. Key on item identifier so the same
+    # item is recognised across runs regardless of cwd.
+    pending: list[IAItem] = []
+    skipped = 0
+    for item in items:
+        key = f"ia:{item.identifier}"
+        if progress.is_done(key):
+            skipped += 1
+            continue
+        pending.append(item)
+    if skipped:
+        logger.info(f"resume: skipping {skipped} previously-completed IA item(s)")
+
     done = failed = imported = ocred = 0
 
     def _process(item: IAItem) -> bool:
@@ -280,7 +515,9 @@ def _run_ia(
                 ocr_workers=args.ocr_workers,
                 page_chunk=args.max_pages,
                 force_ocr=args.force_ocr,
+                force_text=args.force_text,
                 auto_lang=args.auto_lang,
+                ocr_backend=args.ocr_backend,
             )
             ocred += 1
         else:
@@ -302,18 +539,25 @@ def _run_ia(
                 f"[{result.method}] {item.identifier}: "
                 f"{result.page_count}p {result.word_count:,}w -> {ndjson_path.name}"
             )
+        # Only after the output has been written.
+        progress.mark_done(
+            f"ia:{item.identifier}",
+            method=result.method,
+            pages=result.page_count,
+            words=result.word_count,
+        )
         return True
 
     workers = max(1, args.workers)
     if workers == 1:
-        for item in items:
+        for item in pending:
             if _process(item):
                 done += 1
             else:
                 failed += 1
     else:
         with ThreadPoolExecutor(max_workers=workers) as pool:
-            futures = {pool.submit(_process, item): item for item in items}
+            futures = {pool.submit(_process, item): item for item in pending}
             for fut in as_completed(futures):
                 if fut.result():
                     done += 1
@@ -321,7 +565,8 @@ def _run_ia(
                     failed += 1
 
     logger.info(
-        f"Done. Extracted: {done}, failed: {failed} | djvu-import: {imported}, OCR'd: {ocred}"
+        f"Done. Extracted: {done}, failed: {failed}, skipped(resumed): {skipped} "
+        f"| djvu-import: {imported}, OCR'd: {ocred}"
     )
     return 0 if failed == 0 else 2
 
