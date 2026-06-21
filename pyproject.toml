@@ -41,6 +41,13 @@ dev = [
     "pre-commit>=3.7",
     "pytest>=8.0",
 ]
+# locro: Chrome screen-ai OCR backend. Not on PyPI; pulled from git.
+# Requires Python >=3.12 (locro's own floor). First run also needs the
+# screen-ai shared library + models -- run `locro download` once, or set
+# the LOCRO_MODEL_DIR env var to point at an existing copy.
+locro = [
+    "locro @ git+https://github.com/sergiocorreia/clv-locro.git ; python_version >= '3.12'",
+]
 
 [project.scripts]
 docindex-ocr = "document_indexer.ocr.cli:main"
@@ -56,6 +63,10 @@ build-backend = "hatchling.build"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/document_indexer"]
+
+[tool.hatch.metadata]
+# Required for the `locro` extra, which pulls clv-locro from git (not PyPI).
+allow-direct-references = true
 
 [dependency-groups]
 dev = [
